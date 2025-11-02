@@ -1,13 +1,15 @@
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
 # <HINT> Import any new Models here
-from .models import Course, Enrollment
+from .models import Course, Enrollment, Question, Choice, Submission
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404, render, redirect
 from django.urls import reverse
 from django.views import generic
 from django.contrib.auth import login, logout, authenticate
+from django.contrib.auth.decorators import login_required
 import logging
+
 # Get an instance of a logger
 logger = logging.getLogger(__name__)
 # Create your views here.
@@ -103,34 +105,95 @@ def enroll(request, course_id):
     return HttpResponseRedirect(reverse(viewname='onlinecourse:course_details', args=(course.id,)))
 
 
-# <HINT> Create a submit view to create an exam submission record for a course enrollment,
-# you may implement it based on following logic:
-         # Get user and course object, then get the associated enrollment object created when the user enrolled the course
-         # Create a submission object referring to the enrollment
-         # Collect the selected choices from exam form
-         # Add each selected choice object to the submission object
-         # Redirect to show_exam_result with the submission id
-#def submit(request, course_id):
+# ---- Exam helpers & views ----
 
-
-# An example method to collect the selected choices from the exam form from the request object
 def extract_answers(request):
-   submitted_anwsers = []
-   for key in request.POST:
-       if key.startswith('choice'):
-           value = request.POST[key]
-           choice_id = int(value)
-           submitted_anwsers.append(choice_id)
-   return submitted_anwsers
+    """
+    Collect selected choice IDs from the submitted form.
+    Supports multiple checkboxes per question (uses getlist).
+    Expects names like 'choice_<question_id>'.
+    """
+    submitted_answers = []
+    for key in request.POST:
+        if key.startswith('choice_'):
+            # may contain multiple values for this question
+            values = request.POST.getlist(key)
+            for v in values:
+                try:
+                    submitted_answers.append(int(v))
+                except (TypeError, ValueError):
+                    pass
+    return submitted_answers
 
 
-# <HINT> Create an exam result view to check if learner passed exam and show their question results and result for each question,
-# you may implement it based on the following logic:
-        # Get course and submission based on their ids
-        # Get the selected choice ids from the submission record
-        # For each selected choice, check if it is a correct answer or not
-        # Calculate the total score
-#def show_exam_result(request, course_id, submission_id):
+@login_required
+def submit(request, course_id):
+    """
+    Create a Submission for the current user's Enrollment of this Course.
+    Attach all selected Choice objects, then redirect to results page.
+    """
+    course = get_object_or_404(Course, pk=course_id)
+    enrollment = get_object_or_404(Enrollment, user=request.user, course=course)
+
+    # Create submission
+    submission = Submission.objects.create(enrollment=enrollment)
+
+    # Collect selected choices
+    selected_choice_ids = extract_answers(request)
+    if selected_choice_ids:
+        choices = Choice.objects.filter(id__in=selected_choice_ids)
+        submission.choices.set(choices)
+
+    submission.save()
+
+    return redirect(reverse('onlinecourse:show_exam_result', args=[course.id, submission.id]))
 
 
+@login_required
+def show_exam_result(request, course_id, submission_id):
+    """
+    Evaluate a submission and render results with per-question feedback.
+    Uses Question.is_get_score to decide correctness.
+    Pass threshold = 60% (adjust if needed).
+    """
+    course = get_object_or_404(Course, pk=course_id)
+    submission = get_object_or_404(Submission, pk=submission_id)
 
+    total_points = 0
+    earned_points = 0
+    question_results = []
+
+    # Build a set of selected Choice IDs for quick lookup
+    selected_ids = set(submission.choices.values_list('id', flat=True))
+
+    for question in course.question_set.all():
+        total_points += question.grade
+
+        # selected for this question
+        q_selected_ids = set(
+            submission.choices.filter(question=question).values_list('id', flat=True)
+        )
+
+        is_correct = question.is_get_score(q_selected_ids)
+        if is_correct:
+            earned_points += question.grade
+
+        question_results.append({
+            'question': question,
+            'selected_choices': Choice.objects.filter(id__in=q_selected_ids),
+            'is_correct': is_correct
+        })
+
+    score_percent = round((earned_points / total_points) * 100, 2) if total_points else 0.0
+    passed = score_percent >= 60
+
+    context = {
+        'course': course,
+        'submission': submission,
+        'question_results': question_results,
+        'earned': earned_points,
+        'total': total_points,
+        'score_percent': score_percent,
+        'passed': passed
+    }
+    return render(request, 'onlinecourse/exam_result_bootstrap.html', context)
